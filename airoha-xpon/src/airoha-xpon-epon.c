@@ -121,18 +121,48 @@
 	 AIROHA_EPON_INT_MPCP_TIMEOUT | AIROHA_EPON_INT_REGISTER_REQ_DONE | \
 	 AIROHA_EPON_INT_REGISTER_ACK_DONE)
 
+/*
+ * AIROHA_EPON_INT_STATUS2 is a second, mostly undocumented batch of MAC
+ * events. The driver enables all thirteen bits, so anything the MAC raises
+ * arrives here whether or not it is a fault; treat it as a notification and
+ * decode the bits that the boot logs pin down.
+ *
+ * The two names below come from matching the 2026-11-11 and 2026-11-12 boots,
+ * not from a register description: bit 8 accompanies every Register Request
+ * exchange, bit 10 arrives alongside the OLT's deregister. Everything else is
+ * reported as bitN so an unexpected source stays visible instead of hiding in
+ * a hex mask.
+ */
+#define AIROHA_EPON_INT2_MASK              0x1fff
+#define AIROHA_EPON_INT2_REGISTER_REQ_BIT  8
+#define AIROHA_EPON_INT2_DEREGISTER_BIT    10
+
 #define AIROHA_EPON_DISCOVERY_LLID           GENMASK(4, 0)
 /*
  * Discovery Gates to skip while the optical TX path reports not ready.
  *
- * The readiness flag is latched by the first successful burst, so on a cold
- * start it is necessarily clear and deferring would burn Gates without any
- * evidence that the path is dark. The stock firmware answers the very first
- * Gate and relies on the Gate cadence for retries, so do the same. Only a
- * line that has already registered once may skip a single Gate: at that point
- * the flag carries information, and one Gate covers the re-arm settle time.
+ * Skipping is free only while nothing could have made the transmitter live
+ * yet. On a cold module the gates arrive while the laser is still dark, so an
+ * answered burst is lost and the OLT deregisters the LLID it just granted -
+ * the 2026-11-12 boot did that three times (status 0x41000087) before the
+ * re-open ladder lit the module. Deferring those gates costs nothing because
+ * the ladder, not the Gate cadence, is what moves the line forward.
+ *
+ * Three skips outlast one epoch: the dark-gate watchdog restarts a wedged
+ * epoch 5 s after the gate opens and Gates arrive every 2 s, so an epoch can
+ * carry three of them. A cold start therefore answers no Gate at all and hands
+ * the line straight to the ladder.
  */
-#define AIROHA_EPON_TX_DEFER_LIMIT 1
+#define AIROHA_EPON_TX_DEFER_LIMIT 3
+/*
+ * How many re-opens the wedge may survive before the readiness flag stops
+ * being believable. Every epoch counts its own skips, so without a bound a
+ * transmitter that never reports ready would defer forever and never register;
+ * after this many re-opens a blind burst is the better bet. A cold start only
+ * ever needs the first one, because that is the re-open that relights the
+ * laser.
+ */
+#define AIROHA_EPON_TX_DEFER_MAX_REOPENS 2
 #define AIROHA_EPON_DISCOVERY_REQ_FLAG       BIT(8)
 #define AIROHA_EPON_DISCOVERY_ACK_FLAG       BIT(12)
 #define AIROHA_EPON_DISCOVERY_CMD_DONE       BIT(16)
@@ -299,6 +329,80 @@ void airoha_xpon_epon_debug_pcs(struct airoha_xpon *xpon, struct seq_file *m)
 		airoha_pon_phy_read(xpon, AIROHA_XEPON_PCS_SYNC_LOSS_COUNT));
 }
 
+/*
+ * Turn an INT_STATUS2 mask into something a log reader can act on. Kept free
+ * of side effects so the debugfs dump can reuse it.
+ */
+static void airoha_epon_int2_decode(u32 events, char *buf, size_t len)
+{
+	const char *name;
+	unsigned int bit;
+	size_t used = 0;
+
+	if (!len)
+		return;
+	buf[0] = '\0';
+
+	for (bit = 0; bit < 32 && used < len; bit++) {
+		if (!(events & (1u << bit)))
+			continue;
+
+		/*
+		 * Test this bit alone. Checking the whole mask here would label
+		 * every set bit after the first recognised one.
+		 */
+		switch (bit) {
+		case AIROHA_EPON_INT2_REGISTER_REQ_BIT:
+			name = "register-request";
+			break;
+		case AIROHA_EPON_INT2_DEREGISTER_BIT:
+			name = "deregister";
+			break;
+		default:
+			name = NULL;	/* printed as bitN below */
+			break;
+		}
+
+		if (name)
+			used += scnprintf(buf + used, len - used, "%s%s",
+			                  used ? " " : "", name);
+		else
+			used += scnprintf(buf + used, len - used, "%sbit%u",
+			                  used ? " " : "", bit);
+	}
+}
+
+/*
+ * Notification, not a fault: these bits are raised by the normal registration
+ * handshake, so at warn level they read like a failure that never happened.
+ * mac_error_count and last_mac_error still record every assertion for the
+ * debugfs dump and the status counters.
+ */
+static void airoha_epon_log_int2(struct airoha_xpon *xpon, u32 events)
+{
+	char decoded[96];
+
+	airoha_epon_int2_decode(events, decoded, sizeof(decoded));
+	dev_info_ratelimited(xpon->dev, "EPON MAC event: 0x%04x (%s)\n",
+	                     events, decoded);
+}
+
+/*
+ * The decoded last INT_STATUS2 event is also exported over netlink, so keep
+ * one decoder for both the log, debugfs and the LuCI status page.
+ */
+void airoha_xpon_epon_last_mac_event(struct airoha_xpon *xpon, char *buf,
+                                     size_t len)
+{
+	if (!len)
+		return;
+	if (!xpon->epon.last_mac_error) {
+		buf[0] = '\0';
+		return;
+	}
+	airoha_epon_int2_decode(xpon->epon.last_mac_error, buf, len);
+}
+
 void airoha_xpon_epon_debug_mac(struct airoha_xpon *xpon, struct seq_file *m)
 {
 	/* Active-line registers require EPON MAC initialization first. */
@@ -347,6 +451,13 @@ void airoha_xpon_epon_debug_mac(struct airoha_xpon *xpon, struct seq_file *m)
 	           xpon->epon.reopen_reload_count,
 	           xpon->epon.reopen_pending,
 	           xpon->epon.reopen_holding);
+
+	if (xpon->epon.last_mac_error) {
+		char decoded[96];
+
+		airoha_xpon_epon_last_mac_event(xpon, decoded, sizeof(decoded));
+		seq_printf(m, "last_mac_event: %s\n", decoded);
+	}
 }
 
 static void airoha_xpon_epon_set_discovery_state(struct airoha_xpon *xpon,
@@ -489,7 +600,7 @@ static int airoha_xpon_epon_start_mac(struct airoha_xpon *xpon)
 	airoha_epon_write(xpon, AIROHA_EPON_INT_ENABLE2, 0);
 	airoha_epon_write(xpon, AIROHA_EPON_INT_ENABLE3, 0);
 	airoha_epon_write(xpon, AIROHA_EPON_INT_STATUS, U32_MAX);
-	airoha_epon_write(xpon, AIROHA_EPON_INT_STATUS2, 0x1fff);
+	airoha_epon_write(xpon, AIROHA_EPON_INT_STATUS2, AIROHA_EPON_INT2_MASK);
 	airoha_epon_write(xpon, AIROHA_EPON_INT_STATUS3, U32_MAX);
 	atomic_set(&xpon->epon.pending_events, 0);
 	atomic_set(&xpon->epon.pending_error_events, 0);
@@ -546,7 +657,7 @@ static int airoha_xpon_epon_start_mac(struct airoha_xpon *xpon)
 		return ret;
 	xpon->tx_armed = true;
 
-	airoha_epon_write(xpon, AIROHA_EPON_INT_ENABLE2, 0x1fff);
+	airoha_epon_write(xpon, AIROHA_EPON_INT_ENABLE2, AIROHA_EPON_INT2_MASK);
 	airoha_epon_write(xpon, AIROHA_EPON_INT_ENABLE,
 	                  AIROHA_EPON_INT_LINE_MASK);
 	xpon->mac_initialized = true;
@@ -930,14 +1041,19 @@ irqreturn_t airoha_xpon_epon_irq_fast(struct airoha_xpon *xpon)
 		    READ_ONCE(xpon->epon.mpcp_state) !=
 		            AIROHA_EPON_MPCP_DENIED) {
 			/*
-			 * Only a line that has already carried a Register Request to
-			 * the OLT may defer. The ready flag is latched by the first
-			 * successful burst, so on a cold start it is always clear and
-			 * deferring would discard Gates on no evidence at all: the
-			 * first Gate is answered immediately, exactly like the stock
-			 * firmware, and a dark burst is left to the re-arm ladder.
+			 * A line that has registered before trusts the flag absolutely,
+			 * because a warm re-registration only needs the re-arm settle
+			 * time. A cold start has no such history, so it goes by the
+			 * re-open ladder instead: as long as the wedge has not survived
+			 * a re-open, the flag is still describing a module that has not
+			 * had its chance to light up yet and the Gates are worth skipping.
+			 * Past that point the flag itself is suspect and a blind burst,
+			 * which at least has a chance of winning the LLID, is better than
+			 * silence.
 			 */
-			if (READ_ONCE(xpon->epon.ever_registered) &&
+			if ((READ_ONCE(xpon->epon.ever_registered) ||
+			     READ_ONCE(xpon->epon.reopen_attempts) <
+			             AIROHA_EPON_TX_DEFER_MAX_REOPENS) &&
 			    !airoha_pon_frontend_tx_ready(xpon->frontend) &&
 			    READ_ONCE(xpon->epon.tx_deferrals) <
 			            AIROHA_EPON_TX_DEFER_LIMIT) {
@@ -950,7 +1066,11 @@ irqreturn_t airoha_xpon_epon_irq_fast(struct airoha_xpon *xpon)
 					         "TX path not ready, deferring the Register Request to the next Discovery Gate (up to %u)\n",
 					         AIROHA_EPON_TX_DEFER_LIMIT);
 			} else {
-				WRITE_ONCE(xpon->epon.tx_deferrals, 0);
+				/*
+				 * The count is only cleared when the epoch restarts, so a
+				 * spent budget keeps answering the rest of this epoch's
+				 * Gates blind instead of alternating defer with blind.
+				 */
 				airoha_xpon_epon_send_register_request_fast(xpon);
 			}
 		}
@@ -979,9 +1099,7 @@ irqreturn_t airoha_xpon_epon_irq(struct airoha_xpon *xpon)
 	if (error_events) {
 		xpon->epon.last_mac_error = error_events;
 		xpon->epon.mac_error_count += hweight32(error_events);
-		dev_warn_ratelimited(xpon->dev,
-		                     "EPON MAC error interrupt: 0x%04x\n",
-		                     error_events);
+		airoha_epon_log_int2(xpon, error_events);
 	}
 	if (events & AIROHA_EPON_INT_DISCOVERY_GATE)
 		dev_info(

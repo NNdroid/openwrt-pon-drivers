@@ -18,6 +18,8 @@ bool airoha_xpon_epon_los(struct airoha_xpon *xpon);
 bool airoha_xpon_epon_pcs_synced(struct airoha_xpon *xpon);
 void airoha_xpon_epon_debug_pcs(struct airoha_xpon *xpon, struct seq_file *m);
 void airoha_xpon_epon_debug_mac(struct airoha_xpon *xpon, struct seq_file *m);
+void airoha_xpon_epon_last_mac_event(struct airoha_xpon *xpon, char *buf,
+                                     size_t len);
 int airoha_xpon_epon_advance(struct airoha_xpon *xpon, u32 phy_events,
                              unsigned long *delay);
 bool airoha_xpon_epon_request_reopen(struct airoha_xpon *xpon,

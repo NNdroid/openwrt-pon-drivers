@@ -109,19 +109,35 @@ int airoha_xpon_put_status(struct sk_buff *reply, struct airoha_xpon *xpon)
 		                                  "denied",
 		                                  "unknown" };
 	struct airoha_pon_frontend_diagnostics optics = {};
+	struct airoha_pon_datapath_stats dp_stats = {};
+	struct airoha_pcs_pon_rx_status pcs = {};
 	struct nlattr *group;
-	bool epon, active_epon;
-	int optics_error, ret = -EMSGSIZE;
+	bool epon, active_epon, pcs_available, crypto_active, tx_path_ready;
+	int optics_error, dp_error, ret = -EMSGSIZE;
+	char mac_event[96];
 
-	/* Read I2C telemetry outside the line-state lock used by protocol IRQs. */
+	/*
+	 * I2C telemetry, the frontend's cached TX-ready flag and the QDMA
+	 * counters are sampled outside the line-state lock used by the protocol
+	 * IRQs. None of them needs that lock, and the diagnostics path may sleep.
+	 */
 	optics_error =
 		airoha_pon_frontend_get_diagnostics(xpon->frontend, &optics);
+	tx_path_ready = airoha_pon_frontend_tx_ready(xpon->frontend);
+	dp_error = airoha_eth_pon_get_datapath_stats(xpon->pon_netdev,
+	                                             &dp_stats);
 	mutex_lock(&xpon->state_lock);
 	active_epon = xpon->active_mode_valid &&
 	              airoha_xpon_mode_is_epon(xpon->active_mode);
 	epon = airoha_xpon_mode_is_epon(xpon->active_mode_valid ?
 	                                        xpon->active_mode :
 	                                        xpon->configured_mode);
+	crypto_active = xpon->rx_active && !epon;
+	/* PMA and PCS registers describe the line only when the profile matches. */
+	pcs_available = xpon->active_mode_valid && xpon->pcs_profile_valid &&
+	                airoha_xpon_pcs_profile_matches(xpon->active_mode,
+	                                                xpon->pcs_profile) &&
+	                !airoha_pcs_pon_get_rx_status(xpon->pcs, &pcs);
 
 	group = nla_nest_start(reply, AIROHA_XPON_ATTR_LINE);
 	if (!group)
@@ -177,6 +193,28 @@ int airoha_xpon_put_status(struct sk_buff *reply, struct airoha_xpon *xpon)
 	    nla_put_string(reply, XPON_LINE_PCS_PROFILE,
 	                   airoha_xpon_pcs_profile_name(xpon->pcs_profile)))
 		goto out;
+	/* When the profile does not match, only the availability flag is sent. */
+	if (nla_put_u8(reply, XPON_LINE_PCS_AVAILABLE, pcs_available))
+		goto out;
+	if (pcs_available &&
+	    (nla_put_u8(reply, XPON_LINE_PCS_SIGNAL_DETECTED,
+	                pcs.signal_detected) ||
+	     nla_put_u8(reply, XPON_LINE_PCS_FREQDET_LOCKED,
+	                pcs.freqdet_locked) ||
+	     nla_put_u8(reply, XPON_LINE_PCS_RX_READY_GATE,
+	                pcs.rx_ready_gate) ||
+	     nla_put_u8(reply, XPON_LINE_PCS_RX_FIFO_RESET_RELEASED,
+	                pcs.rx_fifo_reset_released) ||
+	     nla_put_u32(reply, XPON_LINE_PCS_CALIBRATION_STAGE,
+	                 pcs.calibration_stage) ||
+	     nla_put_s32(reply, XPON_LINE_PCS_CALIBRATION_ERROR,
+	                 pcs.calibration_error) ||
+	     nla_put_u32(reply, XPON_LINE_PCS_CALIBRATION_RUNS,
+	                 pcs.calibration_runs) ||
+	     nla_put_u32(reply, XPON_LINE_PCS_EO_GAIN, pcs.eo_gain) ||
+	     nla_put_u32(reply, XPON_LINE_PCS_EO_PEAKING, pcs.eo_peaking) ||
+	     nla_put_u32(reply, XPON_LINE_PCS_EO_FOM, pcs.eo_fom)))
+		goto out;
 	nla_nest_end(reply, group);
 
 	group = nla_nest_start(reply, AIROHA_XPON_ATTR_FRONTEND);
@@ -210,6 +248,10 @@ int airoha_xpon_put_status(struct sk_buff *reply, struct airoha_xpon *xpon)
 	if ((!optics_error &&
 	     (optics.valid & AIROHA_PON_FRONTEND_DIAG_RX_POWER)) &&
 	    nla_put_u32(reply, XPON_FRONTEND_RX_POWER_8472, optics.rx_power))
+		goto out;
+	/* Cached SYS_TX_READY + TX-power-ADC verdict, not just the raw status bit. */
+	if ((!optics_error) &&
+	    nla_put_u8(reply, XPON_FRONTEND_TX_PATH_READY, tx_path_ready))
 		goto out;
 	nla_nest_end(reply, group);
 
@@ -250,6 +292,81 @@ int airoha_xpon_put_status(struct sk_buff *reply, struct airoha_xpon *xpon)
 		    reply, XPON_REGISTRATION_REGISTRATION_ID_CONFIGURED,
 		    xpon->identity.active_identity.registration_id_configured))
 		goto out;
+	if (epon) {
+		airoha_xpon_epon_last_mac_event(xpon, mac_event,
+		                                sizeof(mac_event));
+		if (nla_put_u32(reply, XPON_REGISTRATION_EPON_EPOCH,
+		                xpon->epon.registration_epoch) ||
+		    nla_put_u32(reply, XPON_REGISTRATION_EPON_REOPENS,
+		                xpon->epon.reopen_count) ||
+		    nla_put_u32(reply, XPON_REGISTRATION_EPON_REOPEN_ATTEMPTS,
+		                xpon->epon.reopen_attempts) ||
+		    nla_put_u32(reply, XPON_REGISTRATION_EPON_REOPEN_RELOADS,
+		                xpon->epon.reopen_reload_count) ||
+		    nla_put_u32(reply, XPON_REGISTRATION_EPON_TX_DEFERRALS,
+		                xpon->epon.tx_deferrals) ||
+		    nla_put_u32(reply, XPON_REGISTRATION_EPON_REREGISTERS,
+		                xpon->epon.reregister_count) ||
+		    nla_put_u32(reply, XPON_REGISTRATION_EPON_DEREGISTERS,
+		                xpon->epon.deregister_count) ||
+		    nla_put_u32(reply,
+		                XPON_REGISTRATION_EPON_REGISTERED_MS,
+		                xpon->epon.registered_since ?
+		                        jiffies_to_msecs(jiffies -
+		                                         xpon->epon.registered_since) :
+		                        0) ||
+		    nla_put_u32(reply,
+		                XPON_REGISTRATION_EPON_LAST_REGISTERED_MS,
+		                jiffies_to_msecs(
+		                        xpon->epon.last_registration_lifetime)) ||
+		    nla_put_u32(reply,
+		                XPON_REGISTRATION_EPON_LAST_REGISTER_STATUS,
+		                xpon->epon.last_register_status) ||
+		    nla_put_string(reply,
+		                   XPON_REGISTRATION_EPON_LAST_MAC_EVENT,
+		                   mac_event) ||
+		    nla_put_u8(reply,
+		               XPON_REGISTRATION_EPON_EVER_REGISTERED,
+		               xpon->epon.ever_registered) ||
+		    nla_put_u8(reply,
+		               XPON_REGISTRATION_EPON_REOPEN_PENDING,
+		               xpon->epon.reopen_pending))
+			goto out;
+	} else {
+		if (nla_put_u32(reply,
+		                XPON_REGISTRATION_ITU_PLOAMD_ACCEPTED,
+		                xpon->stats.ploamd_accepted) ||
+		    nla_put_u32(reply,
+		                XPON_REGISTRATION_ITU_PLOAMD_REJECTED,
+		                xpon->stats.ploamd_rejected) ||
+		    nla_put_u8(reply, XPON_REGISTRATION_CRYPTO_ACTIVE,
+		               crypto_active))
+			goto out;
+		/* The key registers only describe a live ITU-T receive path. */
+		if (crypto_active &&
+		    (nla_put_u8(
+		             reply,
+		             XPON_REGISTRATION_CRYPTO_DEFAULT_IK_PROGRAMMED,
+		             xpon->crypto.default_ploam_ik_programmed) ||
+		     nla_put_u8(
+		             reply,
+		             XPON_REGISTRATION_CRYPTO_ACTIVATION_KEYS_PROGRAMMED,
+		             xpon->crypto.activation_keys_programmed) ||
+		     nla_put_u32(
+		             reply,
+		             XPON_REGISTRATION_CRYPTO_KEY_EXCHANGE_STATE,
+		             xpon->crypto.exchange_state) ||
+		     nla_put_u32(
+		             reply,
+		             XPON_REGISTRATION_CRYPTO_KEY_EXCHANGE_ERRORS,
+		             xpon->crypto.key_exchange_error_count) ||
+		     nla_put_u32(
+		             reply,
+		             XPON_REGISTRATION_CRYPTO_CURRENT_KEY_INDEX,
+		             airoha_xgpon_read(xpon,
+		                               AIROHA_XGPON_CUR_KIDX))))
+			goto out;
+	}
 	nla_nest_end(reply, group);
 
 	group = nla_nest_start(reply, AIROHA_XPON_ATTR_DATAPATH);
@@ -259,6 +376,36 @@ int airoha_xpon_put_status(struct sk_buff *reply, struct airoha_xpon *xpon)
 	               xpon->data_path.configured))
 		goto out;
 	if (nla_put_u8(reply, XPON_DATAPATH_SERVICE_READY, xpon->service_ready))
+		goto out;
+	/* Omit the whole QDMA group when the Ethernet driver could not read it. */
+	if (!dp_error &&
+	    (nla_put_u64_64bit(reply,
+	                       XPON_DATAPATH_TX_PACKETS_SUBMITTED,
+	                       dp_stats.tx_packets_submitted,
+	                       XPON_DATAPATH_UNSPEC) ||
+	     nla_put_u64_64bit(reply,
+	                       XPON_DATAPATH_TX_PACKETS_COMPLETED,
+	                       dp_stats.tx_packets_completed,
+	                       XPON_DATAPATH_UNSPEC) ||
+	     nla_put_u64_64bit(reply,
+	                       XPON_DATAPATH_TX_PACKETS_DROPPED,
+	                       dp_stats.tx_dropped +
+	                               dp_stats.tx_packets_hw_dropped,
+	                       XPON_DATAPATH_UNSPEC) ||
+	     nla_put_u64_64bit(reply, XPON_DATAPATH_TX_NO_MAPPING,
+	                       dp_stats.tx_no_mapping,
+	                       XPON_DATAPATH_UNSPEC) ||
+	     nla_put_u64_64bit(reply,
+	                       XPON_DATAPATH_RX_PACKETS_DELIVERED,
+	                       dp_stats.rx_packets_delivered,
+	                       XPON_DATAPATH_UNSPEC) ||
+	     nla_put_u64_64bit(reply,
+	                       XPON_DATAPATH_RX_DESCRIPTORS_DROPPED,
+	                       dp_stats.rx_descriptors_dropped,
+	                       XPON_DATAPATH_UNSPEC) ||
+	     nla_put_u64_64bit(reply, XPON_DATAPATH_RX_CRC_ERRORS,
+	                       dp_stats.rx_crc_errors,
+	                       XPON_DATAPATH_UNSPEC)))
 		goto out;
 	nla_nest_end(reply, group);
 

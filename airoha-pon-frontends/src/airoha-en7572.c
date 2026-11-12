@@ -73,9 +73,19 @@
  * SYSTEM_STATUS bit 0 follows the transmitter, not the host gate: it stays
  * clear while the analog TX path emits nothing even though bias current is
  * already commanded, whereas every DDMI channel keeps its last value. It is
- * therefore the only reliable "is the laser actually on" signal on this part.
+ * necessary but not sufficient evidence: on a cold module the bit oscillates
+ * high for hundreds of milliseconds and low again while the laser stays dark,
+ * so it has to be confirmed against the TX power monitor. See
+ * en7572_tx_path_query().
  */
 #define EN7572_SYS_TX_READY          BIT(0)
+
+/*
+ * TX power ADC floor for "the laser is emitting". A dark transmitter reads
+ * 0x0001 even though bias current is already flowing; the same module with
+ * light on the fiber reads 0x466e. Nothing was ever measured in between.
+ */
+#define EN7572_TX_POWER_MIN 0x0800
 
 /*
  * The stock runtime restores these 40 bytes when the threshold table is
@@ -672,26 +682,70 @@ static const unsigned int en7572_sample_ms[] = { 2000, 2000, 4000 };
 static const char *const en7572_sample_tag[] = { "tx+2.0s", "tx+4.0s",
                                                  "tx+8.0s" };
 
+/*
+ * "The TX path is live" means light on the fiber, not a status bit.
+ *
+ * SYS_TX_READY alone is not enough evidence. The 2026-11-12 boot published
+ * ready three times (1.7 s, 3.75 s and 5.7 s after the Gate opened) with the
+ * TX power ADC pinned at 0x0001 and SYS.TX_READY dropping back to 0 in
+ * between: the bit oscillates while a cold module refuses to emit. Every
+ * registration won in that window died one second later, and the oscillation
+ * also kept clearing the xpon dark-gate timer, so the line burned three dead
+ * registrations before the recovery ladder finally reopened it.
+ *
+ * Reading the power monitor as well costs nothing on a warm line, because the
+ * analog path has to emit before a burst can be measured at all.
+ */
+static int en7572_tx_path_query(struct en7572 *en, bool *live)
+{
+	u16 tx_power = 0;
+	u32 sys = 0;
+	int ret;
+
+	ret = en7572_read_u32(en->runtime, EN7572_SYSTEM_STATUS_REG, &sys);
+	if (ret)
+		return ret;
+
+	if (!(sys & EN7572_SYS_TX_READY)) {
+		*live = false;
+		return 0;
+	}
+
+	ret = en7572_read_be16(en->runtime, EN7572_TX_POWER_REG, &tx_power);
+	if (ret) {
+		/*
+		 * The monitor answered on every boot so far; a bus hiccup must not
+		 * turn a transmitter that really is on into a line that can never
+		 * report ready.
+		 */
+		*live = true;
+		return 0;
+	}
+
+	*live = tx_power >= EN7572_TX_POWER_MIN;
+	return 0;
+}
+
 static bool en7572_tx_ready(struct en7572 *en)
 {
-	u32 sys = 0;
+	bool live = true;
 
-	if (en7572_read_u32(en->runtime, EN7572_SYSTEM_STATUS_REG, &sys))
+	if (en7572_tx_path_query(en, &live))
 		return true;	/* never flap the line over a single read error */
 
-	return !!(sys & EN7572_SYS_TX_READY);
+	return live;
 }
 
 #define EN7572_READY_POLL_MS        20
 #define EN7572_READY_POLL_WINDOW_MS 8000
 #define EN7572_READY_POLL_IDLE_MS   1000
 /*
- * One sample is not evidence. On this hardware SYS_TX_READY came up 3.9 s after
- * the gate opened and was already clear again at the 4 s capture, while the
- * laser was still dark (TX power ADC read 0x0001 instead of 0x466e). The MAC
- * answered Gates in that window and every registration it won died one second
- * later. Require the latch to hold across a run longer than that false window,
- * which costs about 140 ms once the analog path really does settle.
+ * The confirmation run debounces the bit; it cannot make the bit truthful. A
+ * run of eight samples is 160 ms, and the 2026-11-12 boot held SYS_TX_READY
+ * high for far longer than that while the laser stayed dark, so the TX power
+ * check in en7572_tx_path_query() is what actually gates the answer. Keeping
+ * the run still shortens the window in which one spurious sample can publish
+ * ready, at a cost of about 160 ms once the analog path really does settle.
  */
 #define EN7572_READY_CONFIRM        8
 
@@ -722,23 +776,32 @@ static void en7572_ready_work(struct work_struct *work)
 {
 	struct en7572 *en = container_of(to_delayed_work(work), struct en7572,
 	                                 ready_work);
-	bool hw_ready;
+	bool live;
 	bool ready;
 	unsigned int delay;
-	u32 sys = 0;
 
 	if (!READ_ONCE(en->tx_gate_enabled))
 		return;
 
-	if (en7572_read_u32(en->runtime, EN7572_SYSTEM_STATUS_REG, &sys)) {
+	if (en7572_tx_path_query(en, &live)) {
 		/* An unreadable bus proves nothing; keep the last answer. */
 		schedule_delayed_work(&en->ready_work,
 		                      msecs_to_jiffies(EN7572_READY_POLL_MS));
 		return;
 	}
 
-	hw_ready = !!(sys & EN7572_SYS_TX_READY);
-	if (!hw_ready)
+	/*
+	 * The gate may have closed while the bus access above was in flight. Every
+	 * close path publishes tx_gate_enabled = false before it clears the cached
+	 * flag, so re-reading it here drops the vast majority of those samples
+	 * instead of letting them publish a stale "ready" behind a dark gate.
+	 * The tiny window between here and the write below is closed by the
+	 * post-publish check further down.
+	 */
+	if (!READ_ONCE(en->tx_gate_enabled))
+		return;
+
+	if (!live)
 		en->ready_confirm = 0;
 	else if (en->ready_confirm < EN7572_READY_CONFIRM)
 		en->ready_confirm++;
@@ -753,6 +816,15 @@ static void en7572_ready_work(struct work_struct *work)
 	}
 
 	/*
+	 * A close that landed between the early check and the write above has
+	 * already called clear_ready(), so ours won. Undo the publication. A
+	 * close that lands after this check wins on its own. Either way a closed
+	 * gate never leaves the "ready" value the MAC's dark watchdog trusts.
+	 */
+	if (!READ_ONCE(en->tx_gate_enabled))
+		en7572_clear_ready(en);
+
+	/*
 	 * Keep the fast poll while the answer has not settled, so the run of
 	 * confirmations costs milliseconds instead of full idle periods. A line
 	 * that already settled drops back to the slow poll that keeps the cached
@@ -760,14 +832,13 @@ static void en7572_ready_work(struct work_struct *work)
 	 */
 	if (ready)
 		delay = EN7572_READY_POLL_IDLE_MS;
-	else if (hw_ready)
+	else if (live ||
+	         !time_after(jiffies, en->gate_opened +
+	                                         msecs_to_jiffies(
+	                                                 EN7572_READY_POLL_WINDOW_MS)))
 		delay = EN7572_READY_POLL_MS;
-	else if (time_after(jiffies, en->gate_opened +
-	                                 msecs_to_jiffies(
-	                                         EN7572_READY_POLL_WINDOW_MS)))
-		delay = EN7572_READY_POLL_IDLE_MS;
 	else
-		delay = EN7572_READY_POLL_MS;
+		delay = EN7572_READY_POLL_IDLE_MS;
 
 	schedule_delayed_work(&en->ready_work, msecs_to_jiffies(delay));
 }
