@@ -73,19 +73,17 @@ struct airoha_xpon_epon {
 	bool llid_valid;
 	bool pcs_synced;
 	bool discovery_seen;
-	/*
-	 * The burst path has carried a Register Request to the OLT at least once
-	 * in this session. Only then does the TX-ready flag predict anything.
-	 */
+	/* Diagnostic history: the OLT has granted an LLID at least once. */
 	bool ever_registered;
 	unsigned long denied_until;
 	/* Hard IRQ updates these values; readers use atomic_read(). */
 	atomic_t discovery_gate_count;
 	atomic_t register_request_count;
 	/*
-	 * Discovery Gates skipped because the optical TX path had not reported
-	 * ready yet. A Register Request sent into that window is lost and latches
-	 * the MAC discovery state machine, so the gate is deferred instead.
+	 * Deprecated. Register Request deferral was removed after the 2026-11-12
+	 * cold boot proved it delays light instead of avoiding dead LLIDs. The
+	 * field and its netlink attribute stay for ABI compatibility and always
+	 * read zero; see XPON_REGISTRATION_EPON_TX_DEFERRALS.
 	 */
 	unsigned int tx_deferrals;
 	/*
@@ -365,15 +363,18 @@ struct airoha_xpon {
 /*
  * A burst gate that never lights cannot be fixed by another Register Request:
  * on this hardware the analog path only settles after a full frontend
- * re-prepare, which is what the reopen does. Waiting for three short-lived
- * registrations to prove that costs about seven seconds of cold start, so ask
- * for the reopen once the gate has been dark this long.
+ * re-prepare, which is what the reopen does.
  *
- * Measured here: a gate that does light reports ready 3.7 s after it opened, so
- * anything still dark at 5 s is a warm-up that failed rather than one still in
- * progress. Every second beyond that is a second of dead cold start.
+ * The threshold must outlast the EN7572 analog warm-up. With the TX power ADC
+ * as the readiness criterion, the 2026-11-12 cold boot reported
+ * "TX path ready 7970 ms after the gate opened", and
+ * EN7572_READY_POLL_WINDOW_MS is 8000. The old 5000 ms value reopened the
+ * line about 3 s before the laser would have lit, and every reopen reset
+ * gate_opened and TX bias, so no epoch ever completed the warm-up.
+ * 12000 ms leaves the measured 8 s a 4 s margin; a transmitter that is truly
+ * dead is still recovered, just later.
  */
-#define AIROHA_XPON_TX_DARK_MS          5000
+#define AIROHA_XPON_TX_DARK_MS          12000
 
 static inline u32 airoha_xgpon_read(struct airoha_xpon *xpon, u32 reg)
 {

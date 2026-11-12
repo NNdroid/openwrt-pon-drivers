@@ -625,8 +625,11 @@ static void airoha_xpon_link_work(struct work_struct *work)
 	/*
 	 * A gate that stays dark cannot be fixed by another Register Request: the
 	 * analog path only settles after a full frontend re-prepare, which is what
-	 * the reopen does. Ask for it directly rather than waiting for three
-	 * short-lived registrations to prove the same thing.
+	 * the reopen does. This only queues a request: the close/open runs in
+	 * reopen_work, and reopen_after may throttle or drop it. The old message
+	 * claimed an epoch was "restarting" even when no close ever happened,
+	 * which made four warnings look like four reopens on the 2026-11-12 boot.
+	 * The real close prints its own message in airoha_xpon_reopen_work().
 	 */
 	if (airoha_xpon_mode_is_epon(xpon->active_mode) && xpon->optical_signal &&
 	    xpon->tx_armed && READ_ONCE(auto_reopen)) {
@@ -637,9 +640,19 @@ static void airoha_xpon_link_work(struct work_struct *work)
 		} else if (time_after(jiffies, xpon->epon.tx_dark_since +
 		                               msecs_to_jiffies(
 		                                       AIROHA_XPON_TX_DARK_MS))) {
-			dev_warn(xpon->dev,
-			         "EPON burst gate dark for %u ms; restarting the LLID epoch\n",
-			         AIROHA_XPON_TX_DARK_MS);
+			/*
+			 * The MPCP wedge ladder, discovery silence and the debugfs
+			 * restart hook can also set reopen_pending. Repeating the
+			 * warning for an already queued request implies an action
+			 * that never happens, so only the fresh request is logged.
+			 */
+			if (!xpon->epon.reopen_pending)
+				dev_warn(xpon->dev,
+				         "EPON burst gate dark for %u ms; requesting a line re-open\n",
+				         AIROHA_XPON_TX_DARK_MS);
+			else
+				dev_dbg(xpon->dev,
+				        "EPON burst gate still dark; a line re-open is already queued\n");
 			xpon->epon.reopen_pending = true;
 			xpon->epon.tx_dark_since = 0;
 		}

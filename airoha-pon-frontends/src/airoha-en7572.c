@@ -768,9 +768,11 @@ static void en7572_clear_ready(struct en7572 *en)
 
 /*
  * Warm lines report ready within a few hundred milliseconds of the gate
- * opening, cold ones need more than a second. Poll fast until the answer
- * settles, so the MAC answers the first Discovery Gate that really is backed
- * by light, then fall back to a slow poll that keeps the cached flag honest.
+ * opening; a cold EN7572 needed 7970 ms on the 2026-11-12 boot. Poll fast
+ * until the answer settles, then fall back to a slow poll that keeps the
+ * cached flag honest. The MAC answers every Discovery Gate regardless of
+ * this flag - the first Register Request burst is what charges the analog
+ * path - so it is used by watchdogs and diagnostics, not for gating bursts.
  */
 static void en7572_ready_work(struct work_struct *work)
 {
@@ -871,13 +873,13 @@ static void en7572_sample_work(struct work_struct *work)
 
 	/*
 	 * The captures only report. An earlier version re-committed the
-	 * calibration here whenever the first capture was dark, but two boots
-	 * showed the analog path needs about two to four seconds after the gate
-	 * opens, so a two second verdict lands inside the warm-up and the
-	 * re-commit restarts it. Measured cost of that misfire: 3.8 s of cold
-	 * start on both boots. The Register Request deferral keeps the line
-	 * quiet while it warms up, so there is nothing left for a re-commit to
-	 * fix: the ladder owns recovery now.
+	 * calibration here whenever the first capture was dark, but the analog
+	 * path needs up to about 8 s after the gate opens, so a two second
+	 * verdict lands inside the warm-up and the re-commit restarts it.
+	 * Measured cost of that misfire: 3.8 s of cold start on both boots.
+	 * Register Requests are now sent throughout the warm-up (deferring
+	 * them was tried and made it worse); the dark-gate watchdog owns
+	 * recovery if the path never lights.
 	 */
 	if (en->tx_gate_enabled && !en7572_tx_ready(en)) {
 		if (!shot) {

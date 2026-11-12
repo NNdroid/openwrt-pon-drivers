@@ -138,31 +138,6 @@
 #define AIROHA_EPON_INT2_DEREGISTER_BIT    10
 
 #define AIROHA_EPON_DISCOVERY_LLID           GENMASK(4, 0)
-/*
- * Discovery Gates to skip while the optical TX path reports not ready.
- *
- * Skipping is free only while nothing could have made the transmitter live
- * yet. On a cold module the gates arrive while the laser is still dark, so an
- * answered burst is lost and the OLT deregisters the LLID it just granted -
- * the 2026-11-12 boot did that three times (status 0x41000087) before the
- * re-open ladder lit the module. Deferring those gates costs nothing because
- * the ladder, not the Gate cadence, is what moves the line forward.
- *
- * Three skips outlast one epoch: the dark-gate watchdog restarts a wedged
- * epoch 5 s after the gate opens and Gates arrive every 2 s, so an epoch can
- * carry three of them. A cold start therefore answers no Gate at all and hands
- * the line straight to the ladder.
- */
-#define AIROHA_EPON_TX_DEFER_LIMIT 3
-/*
- * How many re-opens the wedge may survive before the readiness flag stops
- * being believable. Every epoch counts its own skips, so without a bound a
- * transmitter that never reports ready would defer forever and never register;
- * after this many re-opens a blind burst is the better bet. A cold start only
- * ever needs the first one, because that is the re-open that relights the
- * laser.
- */
-#define AIROHA_EPON_TX_DEFER_MAX_REOPENS 2
 #define AIROHA_EPON_DISCOVERY_REQ_FLAG       BIT(8)
 #define AIROHA_EPON_DISCOVERY_ACK_FLAG       BIT(12)
 #define AIROHA_EPON_DISCOVERY_CMD_DONE       BIT(16)
@@ -1041,38 +1016,21 @@ irqreturn_t airoha_xpon_epon_irq_fast(struct airoha_xpon *xpon)
 		    READ_ONCE(xpon->epon.mpcp_state) !=
 		            AIROHA_EPON_MPCP_DENIED) {
 			/*
-			 * A line that has registered before trusts the flag absolutely,
-			 * because a warm re-registration only needs the re-arm settle
-			 * time. A cold start has no such history, so it goes by the
-			 * re-open ladder instead: as long as the wedge has not survived
-			 * a re-open, the flag is still describing a module that has not
-			 * had its chance to light up yet and the Gates are worth skipping.
-			 * Past that point the flag itself is suspect and a blind burst,
-			 * which at least has a chance of winning the LLID, is better than
-			 * silence.
+			 * Answer every Gate, including the ones that arrive while the
+			 * laser is still dark. Deferring Register Requests was tried
+			 * on 2026-11-12 and made cold starts about 14 s worse: the
+			 * first Register Request burst is what charges the EN7572
+			 * analog TX path (TX bias stayed 0x0000 through two deferred
+			 * epochs and only rose after a blind request), so waiting for
+			 * tx_ready before transmitting is a causal deadlock. Skipping
+			 * one Gate also silences the whole epoch, because the dark-gate
+			 * watchdog tears it down before the next one arrives.
+			 *
+			 * A dark burst costs at most one short-lived LLID; the OLT
+			 * deregisters it on its own. Recovery from a warm-up that
+			 * never finishes belongs to AIROHA_XPON_TX_DARK_MS.
 			 */
-			if ((READ_ONCE(xpon->epon.ever_registered) ||
-			     READ_ONCE(xpon->epon.reopen_attempts) <
-			             AIROHA_EPON_TX_DEFER_MAX_REOPENS) &&
-			    !airoha_pon_frontend_tx_ready(xpon->frontend) &&
-			    READ_ONCE(xpon->epon.tx_deferrals) <
-			            AIROHA_EPON_TX_DEFER_LIMIT) {
-				unsigned int deferrals =
-					READ_ONCE(xpon->epon.tx_deferrals) + 1;
-
-				WRITE_ONCE(xpon->epon.tx_deferrals, deferrals);
-				if (deferrals == 1)
-					dev_info(xpon->dev,
-					         "TX path not ready, deferring the Register Request to the next Discovery Gate (up to %u)\n",
-					         AIROHA_EPON_TX_DEFER_LIMIT);
-			} else {
-				/*
-				 * The count is only cleared when the epoch restarts, so a
-				 * spent budget keeps answering the rest of this epoch's
-				 * Gates blind instead of alternating defer with blind.
-				 */
-				airoha_xpon_epon_send_register_request_fast(xpon);
-			}
+			airoha_xpon_epon_send_register_request_fast(xpon);
 		}
 	}
 
@@ -1145,8 +1103,20 @@ irqreturn_t airoha_xpon_epon_irq(struct airoha_xpon *xpon)
 		/*
 		 * Timeouts outside the registered state belong to normal discovery
 		 * and must not escalate; a registered MAC has a grant every period.
+		 *
+		 * A frontend that still reports a dark TX path is in its analog
+		 * warm-up, not wedged. Silence and short-lived LLIDs are expected
+		 * there, and the three-strike escalation used to fire after about
+		 * 6 s - before the measured ~8 s warm-up - tearing down the epoch
+		 * and restarting the warm-up from zero on every reopen. Keep both
+		 * counters at zero while dark so the first timeout after the laser
+		 * lights is judged on its own, and leave a warm-up that never
+		 * completes to the dark-gate watchdog.
 		 */
-		if (xpon->epon.mpcp_state == AIROHA_EPON_MPCP_REGISTERED) {
+		if (!airoha_pon_frontend_tx_ready(xpon->frontend)) {
+			xpon->epon.registered_timeout_streak = 0;
+			WRITE_ONCE(xpon->epon.requests_since_message, 0);
+		} else if (xpon->epon.mpcp_state == AIROHA_EPON_MPCP_REGISTERED) {
 			/*
 			 * Only a tight re-registration loop escalates: a registration
 			 * that survives for a while proves the burst path works.
