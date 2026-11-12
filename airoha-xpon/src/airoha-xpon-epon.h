@@ -20,8 +20,13 @@ void airoha_xpon_epon_debug_pcs(struct airoha_xpon *xpon, struct seq_file *m);
 void airoha_xpon_epon_debug_mac(struct airoha_xpon *xpon, struct seq_file *m);
 void airoha_xpon_epon_last_mac_event(struct airoha_xpon *xpon, char *buf,
                                      size_t len);
+/* Live MPCP/OAM counters; only meaningful while the EPON MAC is running. */
+void airoha_xpon_epon_mpcp_counters(struct airoha_xpon *xpon, u32 *rx_mpcp,
+                                    u32 *tx_mpcp, u32 *rx_oam);
 int airoha_xpon_epon_advance(struct airoha_xpon *xpon, u32 phy_events,
                              unsigned long *delay);
+/* Called from link_work under state_lock once an LLID proves stable. */
+void airoha_xpon_epon_commit_link(struct airoha_xpon *xpon);
 bool airoha_xpon_epon_request_reopen(struct airoha_xpon *xpon,
                                      unsigned long *delay);
 bool airoha_xpon_epon_reopen_begin(struct airoha_xpon *xpon);

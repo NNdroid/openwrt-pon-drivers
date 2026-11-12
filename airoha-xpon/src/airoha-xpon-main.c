@@ -623,6 +623,14 @@ static void airoha_xpon_link_work(struct work_struct *work)
 	airoha_xpon_leds_update(xpon);
 
 	/*
+	 * Publish carrier only after the LLID survived a full grant cycle, and
+	 * retire any queued re-open at the same time. Run before the watchdog
+	 * and request_reopen() below so a stable line is not torn down again.
+	 */
+	if (airoha_xpon_mode_is_epon(xpon->active_mode))
+		airoha_xpon_epon_commit_link(xpon);
+
+	/*
 	 * A gate that stays dark cannot be fixed by another Register Request: the
 	 * analog path only settles after a full frontend re-prepare, which is what
 	 * the reopen does. This only queues a request: the close/open runs in
@@ -630,9 +638,21 @@ static void airoha_xpon_link_work(struct work_struct *work)
 	 * claimed an epoch was "restarting" even when no close ever happened,
 	 * which made four warnings look like four reopens on the 2026-11-12 boot.
 	 * The real close prints its own message in airoha_xpon_reopen_work().
+	 *
+	 * A committed registration outranks the cached TX power flag: holding an
+	 * LLID for AIROHA_EPON_LINK_UP_CONFIRM_MS means the OLT kept granting and
+	 * kept accepting REGISTER_ACK, so upstream light is working whatever the
+	 * ADC says. The 12:10 boot stayed at txp=0x0001 all run and modules differ
+	 * in calibration (rev 0x007d vs 0x04e2), so arming this watchdog on a
+	 * healthy line would reopen it every 5 s forever. This is not the f788275
+	 * mistake: that used an unreliable flag to DISABLE recovery and left the
+	 * line flapping. Here a positive MAC/OLT handshake only suppresses an
+	 * unnecessary action, and reset_registration() takes lifecycle out of
+	 * OPERATIONAL on the very first MPCP timeout, re-arming the watchdog.
 	 */
 	if (airoha_xpon_mode_is_epon(xpon->active_mode) && xpon->optical_signal &&
-	    xpon->tx_armed && READ_ONCE(auto_reopen)) {
+	    xpon->tx_armed && READ_ONCE(auto_reopen) &&
+	    xpon->lifecycle != AIROHA_XPON_OPERATIONAL) {
 		if (airoha_pon_frontend_tx_ready(xpon->frontend)) {
 			xpon->epon.tx_dark_since = 0;
 		} else if (!xpon->epon.tx_dark_since) {

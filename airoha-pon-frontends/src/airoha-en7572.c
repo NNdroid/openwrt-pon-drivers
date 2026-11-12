@@ -768,11 +768,11 @@ static void en7572_clear_ready(struct en7572 *en)
 
 /*
  * Warm lines report ready within a few hundred milliseconds of the gate
- * opening; a cold EN7572 needed 7970 ms on the 2026-11-12 boot. Poll fast
- * until the answer settles, then fall back to a slow poll that keeps the
- * cached flag honest. The MAC answers every Discovery Gate regardless of
- * this flag - the first Register Request burst is what charges the analog
- * path - so it is used by watchdogs and diagnostics, not for gating bursts.
+ * opening; a cold EN7572 needed 7970 ms on the 11:52 2026-11-12 boot, and
+ * another boot never reported ready at all. Poll fast until the answer
+ * settles, then fall back to a slow poll that keeps the cached flag honest.
+ * This flag feeds the xpon watchdogs, the Discovery Gate policy and the
+ * status export; the registration policy itself lives in airoha-xpon-epon.c.
  */
 static void en7572_ready_work(struct work_struct *work)
 {
@@ -877,15 +877,14 @@ static void en7572_sample_work(struct work_struct *work)
 	 * path needs up to about 8 s after the gate opens, so a two second
 	 * verdict lands inside the warm-up and the re-commit restarts it.
 	 * Measured cost of that misfire: 3.8 s of cold start on both boots.
-	 * Register Requests are now sent throughout the warm-up (deferring
-	 * them was tried and made it worse); the dark-gate watchdog owns
-	 * recovery if the path never lights.
+	 * Light-up is not a fixed delay - some boots never report ready - so
+	 * recovery belongs to the xpon re-open ladder, not this sampler.
 	 */
 	if (en->tx_gate_enabled && !en7572_tx_ready(en)) {
 		if (!shot) {
 			en7572_log_analog(en, "tx-dark");
 			dev_warn(&en->program->dev,
-			         "TX path not ready %u ms after the gate opened, waiting for the analog warm-up\n",
+			         "TX path not ready %u ms after the gate opened (dark sample; recovery belongs to the xpon re-open ladder)\n",
 			         en7572_sample_ms[0]);
 		}
 		if (shot == ARRAY_SIZE(en7572_sample_ms) - 1)

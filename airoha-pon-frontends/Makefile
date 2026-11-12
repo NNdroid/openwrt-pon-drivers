@@ -5,7 +5,7 @@ include $(TOPDIR)/rules.mk
 include $(INCLUDE_DIR)/kernel.mk
 
 PKG_NAME:=airoha-pon-frontends
-PKG_RELEASE:=16
+PKG_RELEASE:=17
 PKG_LICENSE:=GPL-2.0-only
 
 include $(INCLUDE_DIR)/package.mk

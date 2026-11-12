@@ -114,6 +114,8 @@ int airoha_xpon_put_status(struct sk_buff *reply, struct airoha_xpon *xpon)
 	struct nlattr *group;
 	bool epon, active_epon, pcs_available, crypto_active, tx_path_ready;
 	int optics_error, dp_error, ret = -EMSGSIZE;
+	u32 denied_ms = 0, cooldown_ms = 0, dark_ms = 0;
+	u32 rx_mpcp = 0, tx_mpcp = 0, rx_oam = 0;
 	char mac_event[96];
 
 	/*
@@ -332,6 +334,58 @@ int airoha_xpon_put_status(struct sk_buff *reply, struct airoha_xpon *xpon)
 		               XPON_REGISTRATION_EPON_REOPEN_PENDING,
 		               xpon->epon.reopen_pending))
 			goto out;
+
+		/* Cooldowns are relative to the reader, never raw jiffies. */
+		if (xpon->epon.denied_until &&
+		    time_before(jiffies, xpon->epon.denied_until))
+			denied_ms = jiffies_to_msecs(xpon->epon.denied_until -
+			                              jiffies);
+		if (xpon->epon.reopen_after &&
+		    time_before(jiffies, xpon->epon.reopen_after))
+			cooldown_ms = jiffies_to_msecs(xpon->epon.reopen_after -
+			                                jiffies);
+		if (xpon->epon.tx_dark_since &&
+		    time_after(jiffies, xpon->epon.tx_dark_since))
+			dark_ms = jiffies_to_msecs(jiffies -
+			                            xpon->epon.tx_dark_since);
+		if (nla_put_u8(reply, XPON_REGISTRATION_EPON_LINK_UP_PENDING,
+		               xpon->epon.link_up_pending) ||
+		    nla_put_u32(reply, XPON_REGISTRATION_EPON_SYNC_TIME,
+		                xpon->epon.sync_time) ||
+		    nla_put_u32(reply, XPON_REGISTRATION_EPON_CHANNEL,
+		                xpon->epon.channel) ||
+		    nla_put_u8(reply, XPON_REGISTRATION_EPON_DISCOVERY_SEEN,
+		               READ_ONCE(xpon->epon.discovery_seen)) ||
+		    nla_put_u32(reply, XPON_REGISTRATION_EPON_DISCOVERY_RETRY,
+		                xpon->epon.discovery_retry) ||
+		    nla_put_u32(reply,
+		                XPON_REGISTRATION_EPON_UNANSWERED_REQUESTS,
+		                READ_ONCE(xpon->epon.requests_since_message)) ||
+		    nla_put_u32(reply,
+		                XPON_REGISTRATION_EPON_REGISTERED_TIMEOUT_STREAK,
+		                xpon->epon.registered_timeout_streak) ||
+		    nla_put_u8(reply, XPON_REGISTRATION_EPON_REOPEN_HOLDING,
+		               xpon->epon.reopen_holding) ||
+		    nla_put_u32(reply,
+		                XPON_REGISTRATION_EPON_REOPEN_COOLDOWN_MS,
+		                cooldown_ms) ||
+		    nla_put_u32(reply, XPON_REGISTRATION_EPON_TX_DARK_MS,
+		                dark_ms) ||
+		    nla_put_u32(reply, XPON_REGISTRATION_EPON_DENIED_MS,
+		                denied_ms))
+			goto out;
+		/* Live MAC counters are only meaningful once the MAC is running. */
+		if (xpon->rx_active && xpon->mac_initialized) {
+			airoha_xpon_epon_mpcp_counters(xpon, &rx_mpcp, &tx_mpcp,
+			                               &rx_oam);
+			if (nla_put_u32(reply, XPON_REGISTRATION_EPON_RX_MPCP,
+			                rx_mpcp) ||
+			    nla_put_u32(reply, XPON_REGISTRATION_EPON_TX_MPCP,
+			                tx_mpcp) ||
+			    nla_put_u32(reply, XPON_REGISTRATION_EPON_RX_OAM,
+			                rx_oam))
+				goto out;
+		}
 	} else {
 		if (nla_put_u32(reply,
 		                XPON_REGISTRATION_ITU_PLOAMD_ACCEPTED,

@@ -138,6 +138,31 @@
 #define AIROHA_EPON_INT2_DEREGISTER_BIT    10
 
 #define AIROHA_EPON_DISCOVERY_LLID           GENMASK(4, 0)
+/*
+ * Discovery Gates to skip while the optical TX path reports not ready.
+ *
+ * This is the converging baseline from the 2026-11-12 11:52 boot. The 12:10
+ * boot removed deferral entirely: every Discovery Gate was answered, which
+ * produced an endless loop of dead LLIDs - one grant every 2 s, one MPCP
+ * timeout a second later - because a dark transmitter can still win an LLID
+ * from the OLT. Skipping bounds how many of those the upper stack has to
+ * absorb; the dark-gate watchdog and the timeout ladder own recovery.
+ *
+ * Three skips outlast one epoch: the watchdog restarts a wedged epoch 5 s
+ * after the gate opens and Gates arrive every 2 s, so an epoch can carry
+ * three of them.
+ */
+#define AIROHA_EPON_TX_DEFER_LIMIT 3
+/*
+ * Until the OLT has granted an LLID once, trust the readiness flag for at most
+ * this many re-opens and then answer every Gate anyway: a transmitter that
+ * never reports ready must not defer forever. Once ever_registered is set the
+ * deferral stays available regardless of this count. The counter is cleared
+ * by the MPCP timeout ladder when a registration survives
+ * AIROHA_EPON_TX_WEDGE_EPOCH_MS - not by reset_registration(), which only
+ * clears the per-epoch tx_deferrals budget.
+ */
+#define AIROHA_EPON_TX_DEFER_MAX_REOPENS 2
 #define AIROHA_EPON_DISCOVERY_REQ_FLAG       BIT(8)
 #define AIROHA_EPON_DISCOVERY_ACK_FLAG       BIT(12)
 #define AIROHA_EPON_DISCOVERY_CMD_DONE       BIT(16)
@@ -178,6 +203,15 @@
  */
 #define AIROHA_EPON_TX_WEDGE_TIMEOUTS     3
 #define AIROHA_EPON_TX_WEDGE_EPOCH_MS     5000
+/*
+ * How long an LLID registration must survive before carrier is published.
+ * A dark transmitter still wins LLID 0x0087 from the OLT, but the grant
+ * stops about one second later: the 12:10 boot logged 53 such grants, each
+ * followed by a link up/down pair, a pppd restart and a cancelled queued
+ * re-open. Twice the measured dead-LLID lifetime is enough to tell a real
+ * registration from a dead one without adding more than 2 s to a good boot.
+ */
+#define AIROHA_EPON_LINK_UP_CONFIRM_MS     2000
 /* The standard MAC path starts at 0x20; OLT values are capped at 0x5f. */
 #define AIROHA_EPON_SYNC_TIME_DEFAULT    0x20
 #define AIROHA_EPON_SYNC_TIME_MAX        0x5f
@@ -378,6 +412,15 @@ void airoha_xpon_epon_last_mac_event(struct airoha_xpon *xpon, char *buf,
 	airoha_epon_int2_decode(xpon->epon.last_mac_error, buf, len);
 }
 
+void airoha_xpon_epon_mpcp_counters(struct airoha_xpon *xpon, u32 *rx_mpcp,
+                                    u32 *tx_mpcp, u32 *rx_oam)
+{
+	/* Register offsets stay private to this file; diagnostics reads them here. */
+	*rx_mpcp = airoha_epon_read(xpon, AIROHA_EPON_RX_MPCP_COUNT);
+	*tx_mpcp = airoha_epon_read(xpon, AIROHA_EPON_TX_MPCP_COUNT);
+	*rx_oam = airoha_epon_read(xpon, AIROHA_EPON_RX_OAM_COUNT);
+}
+
 void airoha_xpon_epon_debug_mac(struct airoha_xpon *xpon, struct seq_file *m)
 {
 	/* Active-line registers require EPON MAC initialization first. */
@@ -506,6 +549,8 @@ static void airoha_xpon_epon_reset_registration(struct airoha_xpon *xpon,
 	xpon->epon.registration_epoch++;
 	airoha_xpon_oam_set_link(xpon->oam, false, 0, 0);
 	airoha_xpon_set_data_path_link(xpon, false);
+	/* A dead LLID never reaches the upper stack; drop its pending commit. */
+	xpon->epon.link_up_pending = false;
 	airoha_eth_pon_configure_epon(xpon->pon_netdev, 0, false);
 	xpon->service_ready = false;
 	xpon->data_path.count = 0;
@@ -949,29 +994,79 @@ static void airoha_xpon_epon_complete_registration(struct airoha_xpon *xpon)
 	xpon->epon.ever_registered = true;
 	xpon->epon.requests_since_message = 0;
 	xpon->epon.registered_since = jiffies;
+	xpon->epon.link_up_pending = true;
 	xpon->data_path.configured = true;
-	xpon->lifecycle = AIROHA_XPON_OPERATIONAL;
+	xpon->lifecycle = AIROHA_XPON_PROTOCOL_ACTIVATING;
+	airoha_xpon_oam_set_link(xpon->oam, true, xpon->epon.llid,
+	                         xpon->epon.channel);
 	/*
-	 * A queued recovery is obsolete the moment the OLT grants the line
-	 * again: cancel_delayed_work() is non-blocking, which is all an IRQ
-	 * thread may do.
+	 * Neither publish carrier nor cancel a queued re-open yet. A dark
+	 * transmitter still wins an LLID from the OLT and loses the grant about
+	 * one second later: the 12:10 boot logged 53 such grants, each followed
+	 * by a link up/down pair, a pppd restart and a cancelled re-open - the
+	 * very re-open that was supposed to relight the module. Both actions
+	 * move to airoha_xpon_epon_commit_link(), once the registration has
+	 * survived AIROHA_EPON_LINK_UP_CONFIRM_MS.
 	 */
+	airoha_xpon_leds_update(xpon);
+	dev_dbg(xpon->dev,
+		"EPON registered: epoch=%u llid=0x%04x channel=%u reopen_attempts=%u\n",
+		xpon->epon.registration_epoch, xpon->epon.llid,
+		xpon->epon.channel, xpon->epon.reopen_attempts);
+	dev_info(xpon->dev,
+	         "EPON LLID0 registered: LLID=0x%04x (carrier pending)\n",
+	         xpon->epon.llid);
+}
+
+/*
+ * Called from link_work under state_lock. Publish carrier and retire a queued
+ * recovery only for a registration that has survived a full grant cycle.
+ */
+void airoha_xpon_epon_commit_link(struct airoha_xpon *xpon)
+{
+	unsigned int stable_ms;
+
+	if (!xpon->epon.link_up_pending)
+		return;
+
+	/*
+	 * link_work samples the optical signal at the top of this same iteration
+	 * but handles LOS below this call. A lost signal, a disarmed TX gate or a
+	 * re-open worker that already owns the line can therefore still look
+	 * REGISTERED for one 250 ms tick: publishing carrier here would raise a
+	 * link that the very same iteration tears down again. Drop the pending
+	 * commit - the epoch reset installs a fresh one once the line is back.
+	 */
+	if (xpon->epon.reopen_holding || !xpon->optical_signal ||
+	    !READ_ONCE(xpon->tx_armed) ||
+	    xpon->epon.mpcp_state != AIROHA_EPON_MPCP_REGISTERED) {
+		xpon->epon.link_up_pending = false;
+		dev_dbg(xpon->dev,
+			"EPON carrier pending dropped: los=%d tx_armed=%d holding=%d state=%u\n",
+			!xpon->optical_signal, READ_ONCE(xpon->tx_armed),
+			xpon->epon.reopen_holding, xpon->epon.mpcp_state);
+		return;
+	}
+
+	/* link_up_pending is only set together with a fresh registered_since. */
+	stable_ms = jiffies_to_msecs(jiffies - xpon->epon.registered_since);
+	if (stable_ms < AIROHA_EPON_LINK_UP_CONFIRM_MS)
+		return;
+
+	xpon->epon.link_up_pending = false;
+	/* Only a stable registration makes a queued recovery obsolete. */
 	if (xpon->epon.reopen_pending) {
 		xpon->epon.reopen_pending = false;
 		cancel_delayed_work(&xpon->reopen_work);
 		dev_dbg(xpon->dev,
 			"EPON line recovered before the queued re-open; dropping it\n");
 	}
-	airoha_xpon_oam_set_link(xpon->oam, true, xpon->epon.llid,
-	                         xpon->epon.channel);
+	xpon->lifecycle = AIROHA_XPON_OPERATIONAL;
 	airoha_xpon_set_data_path_link(xpon, true);
 	airoha_xpon_leds_update(xpon);
-	dev_dbg(xpon->dev,
-		"EPON registered: epoch=%u llid=0x%04x channel=%u reopen_attempts=%u\n",
-		xpon->epon.registration_epoch, xpon->epon.llid,
-		xpon->epon.channel, xpon->epon.reopen_attempts);
-	dev_info(xpon->dev, "EPON LLID0 registered: LLID=0x%04x\n",
-	         xpon->epon.llid);
+	dev_info(xpon->dev,
+	         "EPON line up after %u ms of stable registration\n",
+	         stable_ms);
 }
 
 irqreturn_t airoha_xpon_epon_irq_fast(struct airoha_xpon *xpon)
@@ -1016,21 +1111,39 @@ irqreturn_t airoha_xpon_epon_irq_fast(struct airoha_xpon *xpon)
 		    READ_ONCE(xpon->epon.mpcp_state) !=
 		            AIROHA_EPON_MPCP_DENIED) {
 			/*
-			 * Answer every Gate, including the ones that arrive while the
-			 * laser is still dark. Deferring Register Requests was tried
-			 * on 2026-11-12 and made cold starts about 14 s worse: the
-			 * first Register Request burst is what charges the EN7572
-			 * analog TX path (TX bias stayed 0x0000 through two deferred
-			 * epochs and only rose after a blind request), so waiting for
-			 * tx_ready before transmitting is a causal deadlock. Skipping
-			 * one Gate also silences the whole epoch, because the dark-gate
-			 * watchdog tears it down before the next one arrives.
-			 *
-			 * A dark burst costs at most one short-lived LLID; the OLT
-			 * deregisters it on its own. Recovery from a warm-up that
-			 * never finishes belongs to AIROHA_XPON_TX_DARK_MS.
+			 * Skip a Gate only while the module still deserves the wait.
+			 * A line that has registered before keeps that option for the
+			 * whole session (ever_registered); a cold line keeps it only
+			 * until the wedge has survived MAX_REOPENS re-opens, after
+			 * which the readiness flag itself is suspect. In both cases a
+			 * dark path still answers blind once LIMIT skips are spent,
+			 * because a Request at least has a chance of winning an LLID.
+			 * The 12:10 boot answered every Gate and produced 53 dead
+			 * LLIDs in a row, so removing the skip is not a recovery.
 			 */
-			airoha_xpon_epon_send_register_request_fast(xpon);
+			if ((READ_ONCE(xpon->epon.ever_registered) ||
+			     READ_ONCE(xpon->epon.reopen_attempts) <
+			             AIROHA_EPON_TX_DEFER_MAX_REOPENS) &&
+			    !airoha_pon_frontend_tx_ready(xpon->frontend) &&
+			    READ_ONCE(xpon->epon.tx_deferrals) <
+			            AIROHA_EPON_TX_DEFER_LIMIT) {
+				unsigned int deferrals =
+					READ_ONCE(xpon->epon.tx_deferrals) + 1;
+
+				WRITE_ONCE(xpon->epon.tx_deferrals, deferrals);
+				if (deferrals == 1)
+					dev_info_ratelimited(
+						xpon->dev,
+						"TX path not ready, deferring the Register Request to the next Discovery Gate (up to %u)\n",
+						AIROHA_EPON_TX_DEFER_LIMIT);
+			} else {
+				/*
+				 * The count is only cleared when the epoch restarts, so a
+				 * spent budget keeps answering the rest of this epoch's
+				 * Gates blind instead of alternating defer with blind.
+				 */
+				airoha_xpon_epon_send_register_request_fast(xpon);
+			}
 		}
 	}
 
@@ -1104,19 +1217,12 @@ irqreturn_t airoha_xpon_epon_irq(struct airoha_xpon *xpon)
 		 * Timeouts outside the registered state belong to normal discovery
 		 * and must not escalate; a registered MAC has a grant every period.
 		 *
-		 * A frontend that still reports a dark TX path is in its analog
-		 * warm-up, not wedged. Silence and short-lived LLIDs are expected
-		 * there, and the three-strike escalation used to fire after about
-		 * 6 s - before the measured ~8 s warm-up - tearing down the epoch
-		 * and restarting the warm-up from zero on every reopen. Keep both
-		 * counters at zero while dark so the first timeout after the laser
-		 * lights is judged on its own, and leave a warm-up that never
-		 * completes to the dark-gate watchdog.
+		 * Never gate this ladder on frontend tx_ready. The 12:10 boot never
+		 * reported ready at all, so such a guard suppressed every escalation
+		 * and left the line flapping for minutes with no re-open to fix it.
+		 * A dark path is exactly when the ladder is needed.
 		 */
-		if (!airoha_pon_frontend_tx_ready(xpon->frontend)) {
-			xpon->epon.registered_timeout_streak = 0;
-			WRITE_ONCE(xpon->epon.requests_since_message, 0);
-		} else if (xpon->epon.mpcp_state == AIROHA_EPON_MPCP_REGISTERED) {
+		if (xpon->epon.mpcp_state == AIROHA_EPON_MPCP_REGISTERED) {
 			/*
 			 * Only a tight re-registration loop escalates: a registration
 			 * that survives for a while proves the burst path works.
