@@ -139,6 +139,10 @@ static int airoha_xpon_prepare_frontend_locked(struct airoha_xpon *xpon)
 
 static int airoha_xpon_activate_rx_locked(struct airoha_xpon *xpon)
 {
+	/* A line identity changed while the optics were down must be used by the
+	 * next activation epoch, not wait for another netdev open/LOS edge. */
+	xpon->identity.active_identity = xpon->identity.pending_identity;
+
 	if (airoha_xpon_mode_is_epon(xpon->active_mode))
 		return airoha_xpon_epon_start_rx(xpon);
 
